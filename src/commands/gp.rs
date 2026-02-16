@@ -4,12 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context as _, Result, anyhow};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::context::Context;
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetachedMode {
+    Skip,
+    Fetch,
+}
 
 #[derive(Args, Debug, Clone)]
 pub struct GpArgs {
@@ -18,6 +24,14 @@ pub struct GpArgs {
 
     #[arg(long, help = "Disable progress bar")]
     pub no_progress: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DetachedMode::Skip,
+        help = "What to do when HEAD is detached"
+    )]
+    pub detached: DetachedMode,
 
     #[arg(long, help = "Also descend into repositories to find nested repos")]
     pub include_nested: bool,
@@ -164,6 +178,24 @@ pub fn run(args: &GpArgs, ctx: &Context) -> Result<()> {
 }
 
 fn pull_one(repo_root: &Path, args: &GpArgs, ctx: &Context) -> RepoResult {
+    let head = match head_branch(repo_root) {
+        Ok(h) => h,
+        Err(e) => {
+            return RepoResult {
+                repo_root: repo_root.to_path_buf(),
+                outcome: Outcome::Err {
+                    message: "git head failed".to_string(),
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                },
+            };
+        }
+    };
+
+    if head.is_none() {
+        return detached_repo(repo_root, args, ctx);
+    }
+
     if !args.allow_dirty {
         match is_dirty(repo_root) {
             Ok(true) => {
@@ -230,6 +262,51 @@ fn pull_one(repo_root: &Path, args: &GpArgs, ctx: &Context) -> RepoResult {
     }
 }
 
+fn detached_repo(repo_root: &Path, args: &GpArgs, ctx: &Context) -> RepoResult {
+    match args.detached {
+        DetachedMode::Skip => RepoResult {
+            repo_root: repo_root.to_path_buf(),
+            outcome: Outcome::Skipped("detached".to_string()),
+        },
+        DetachedMode::Fetch => {
+            if ctx.dry_run {
+                return RepoResult {
+                    repo_root: repo_root.to_path_buf(),
+                    outcome: Outcome::Ok {
+                        stdout: format!("dry-run: git -C {} fetch --prune", repo_root.display()),
+                        stderr: String::new(),
+                    },
+                };
+            }
+
+            let output = match Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .arg("fetch")
+                .arg("--prune")
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    return RepoResult {
+                        repo_root: repo_root.to_path_buf(),
+                        outcome: Outcome::Err {
+                            message: "spawn git failed".to_string(),
+                            stdout: String::new(),
+                            stderr: e.to_string(),
+                        },
+                    };
+                }
+            };
+
+            RepoResult {
+                repo_root: repo_root.to_path_buf(),
+                outcome: classify_output(output),
+            }
+        }
+    }
+}
+
 fn classify_output(output: Output) -> Outcome {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -276,6 +353,34 @@ fn is_dirty(repo_root: &Path) -> Result<bool> {
         return Ok(true);
     }
     Ok(!output.stdout.is_empty())
+}
+
+fn head_branch(repo_root: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("symbolic-ref")
+        .arg("-q")
+        .arg("--short")
+        .arg("HEAD")
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to execute git symbolic-ref in {}",
+                repo_root.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(branch))
+    }
 }
 
 pub fn discover_git_repos(root: &Path, include_nested: bool) -> Result<Vec<PathBuf>> {
